@@ -11,6 +11,14 @@
 #include <string>
 #include <algorithm>
 
+#define CUDA_CHECK(call) { \
+    cudaError_t err = call; \
+    if(err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        exit(err); \
+    } \
+}
+
 struct EnvironmentConfig {
     int rows;
     int cols;
@@ -32,9 +40,12 @@ public:
     std::vector<int> grid;
     EnvironmentConfig config;
     int startState, goalState;
-    int *d_grid;
 
     GridWorld(const EnvironmentConfig& envConfig) : config(envConfig) {
+        if(config.obstacleProb + config.slowProb > 1.0f) {
+            std::cerr << "Error: obstacleProb + slowProb exceeds 1.0" << std::endl;
+            exit(1);
+        }
         rows = config.rows;
         cols = config.cols;
         numStates = rows * cols;
@@ -52,15 +63,9 @@ public:
             else if(prob < config.obstacleProb + config.slowProb) grid[i] = 4;
             else grid[i] = 0;
         }
-        cudaMalloc(&d_grid, numStates * sizeof(int));
-        cudaMemcpy(d_grid, grid.data(), numStates * sizeof(int), cudaMemcpyHostToDevice);
     }
 
-    ~GridWorld() {
-        cudaFree(d_grid);
-    }
-
-    int step(int currentState, int action) {
+    int computeIntendedNextState(int currentState, int action) const {
         int row = currentState / cols;
         int col = currentState % cols;
         int new_row = row, new_col = col;
@@ -72,24 +77,30 @@ public:
         else if(action == 5) { new_row = row - 1; new_col = col + 1; }
         else if(action == 6) { new_row = row + 1; new_col = col - 1; }
         else if(action == 7) { new_row = row + 1; new_col = col + 1; }
-        if(new_row < 0 || new_row >= rows || new_col < 0 || new_col >= cols)
-            return currentState;
-        int nextState = new_row * cols + new_col;
-        return nextState;
+        if(new_row < 0 || new_row >= rows || new_col < 0 || new_col >= cols) return -1;
+        return new_row * cols + new_col;
     }
 
-    float getReward(int currentState, int nextState) {
-        if(currentState == nextState) {
+    int step(int currentState, int action) const {
+        int intended = computeIntendedNextState(currentState, action);
+        if (intended == -1) return currentState;
+        if (grid[intended] == 1) return currentState;
+        return intended;
+    }
+
+    float getReward(int currentState, int action, int nextState) const {
+        int intended = computeIntendedNextState(currentState, action);
+        if (currentState == nextState) {
+            if (intended == -1) return config.rewardBoundary;
+            else if (grid[intended] == 1) return config.rewardObstacle;
+            else return config.rewardStep;
+        } else {
             int cellType = grid[nextState];
-            if(cellType == 1) return config.rewardObstacle;
-            else return config.rewardBoundary;
+            if(cellType == 0) return config.rewardEmpty;
+            else if(cellType == 2) return config.rewardGoal;
+            else if(cellType == 4) return config.rewardSlow;
+            else return config.rewardStep;
         }
-        int cellType = grid[nextState];
-        if(cellType == 0) return config.rewardEmpty;
-        else if(cellType == 1) return config.rewardObstacle;
-        else if(cellType == 2) return config.rewardGoal;
-        else if(cellType == 4) return config.rewardSlow;
-        else return config.rewardStep;
     }
 };
 
@@ -122,7 +133,19 @@ __global__ void updateQKernelBatch(const int *states, const int *actions, const 
             target += gamma * maxQ;
         }
         int index = s * numActions + a;
-        d_onlineQ[index] = d_onlineQ[index] + alpha * (target - d_onlineQ[index]);
+        int *addr_as_i = (int*)&d_onlineQ[index];
+        int oldInt = *addr_as_i;
+        float oldVal = __int_as_float(oldInt);
+        int newInt;
+        float newVal;
+        while (true) {
+            newVal = oldVal + alpha * (target - oldVal);
+            newInt = __float_as_int(newVal);
+            int assumed = atomicCAS(addr_as_i, oldInt, newInt);
+            if (assumed == oldInt) break;
+            oldInt = assumed;
+            oldVal = __int_as_float(oldInt);
+        }
     }
 }
 
@@ -141,19 +164,19 @@ public:
       epsilon(initialEpsilon), minEpsilon(minEpsilon), epsilonDecay(epsilonDecay),
       updateTargetEvery(updateTargetEvery), replayCapacity(replayCapacity), replayBatchSize(replayBatchSize)
     {
-        cudaMalloc(&d_onlineQ, numStates * numActions * sizeof(float));
-        cudaMalloc(&d_targetQ, numStates * numActions * sizeof(float));
+        CUDA_CHECK(cudaMalloc(&d_onlineQ, numStates * numActions * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_targetQ, numStates * numActions * sizeof(float)));
         std::vector<float> qInit(numStates * numActions);
         std::mt19937 rng((unsigned int)std::chrono::system_clock::now().time_since_epoch().count());
         std::uniform_real_distribution<float> dist(-0.01f, 0.01f);
         for(auto &val : qInit) { val = dist(rng); }
-        cudaMemcpy(d_onlineQ, qInit.data(), numStates * numActions * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_targetQ, qInit.data(), numStates * numActions * sizeof(float), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMemcpy(d_onlineQ, qInit.data(), numStates * numActions * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_targetQ, qInit.data(), numStates * numActions * sizeof(float), cudaMemcpyHostToDevice));
     }
 
     ~QLearningAgent() {
-        cudaFree(d_onlineQ);
-        cudaFree(d_targetQ);
+        CUDA_CHECK(cudaFree(d_onlineQ));
+        CUDA_CHECK(cudaFree(d_targetQ));
     }
 
     int chooseAction(int state) {
@@ -165,7 +188,7 @@ public:
             return actionDist(rng);
         } else {
             std::vector<float> qValues(numActions);
-            cudaMemcpy(qValues.data(), d_onlineQ + state * numActions, numActions * sizeof(float), cudaMemcpyDeviceToHost);
+            CUDA_CHECK(cudaMemcpy(qValues.data(), d_onlineQ + state * numActions, numActions * sizeof(float), cudaMemcpyDeviceToHost));
             int bestAction = 0;
             float bestValue = qValues[0];
             for (int a = 1; a < numActions; a++) {
@@ -202,30 +225,30 @@ public:
         }
         int *d_states, *d_actions, *d_nextStates, *d_dones;
         float *d_rewards;
-        cudaMalloc(&d_states, replayBatchSize * sizeof(int));
-        cudaMalloc(&d_actions, replayBatchSize * sizeof(int));
-        cudaMalloc(&d_rewards, replayBatchSize * sizeof(float));
-        cudaMalloc(&d_nextStates, replayBatchSize * sizeof(int));
-        cudaMalloc(&d_dones, replayBatchSize * sizeof(int));
-        cudaMemcpy(d_states, states.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_actions, actions.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_rewards, rewards.data(), replayBatchSize * sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_nextStates, nextStates.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_dones, dones.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice);
+        CUDA_CHECK(cudaMalloc(&d_states, replayBatchSize * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_actions, replayBatchSize * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_rewards, replayBatchSize * sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&d_nextStates, replayBatchSize * sizeof(int)));
+        CUDA_CHECK(cudaMalloc(&d_dones, replayBatchSize * sizeof(int)));
+        CUDA_CHECK(cudaMemcpy(d_states, states.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_actions, actions.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_rewards, rewards.data(), replayBatchSize * sizeof(float), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_nextStates, nextStates.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_dones, dones.data(), replayBatchSize * sizeof(int), cudaMemcpyHostToDevice));
         int threads = 256;
         int blocks = (replayBatchSize + threads - 1) / threads;
         updateQKernelBatch<<<blocks, threads>>>(d_states, d_actions, d_rewards, d_nextStates, d_dones,
                                                   d_onlineQ, d_targetQ, alpha, gamma, numActions, replayBatchSize);
-        cudaDeviceSynchronize();
-        cudaFree(d_states);
-        cudaFree(d_actions);
-        cudaFree(d_rewards);
-        cudaFree(d_nextStates);
-        cudaFree(d_dones);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_states));
+        CUDA_CHECK(cudaFree(d_actions));
+        CUDA_CHECK(cudaFree(d_rewards));
+        CUDA_CHECK(cudaFree(d_nextStates));
+        CUDA_CHECK(cudaFree(d_dones));
     }
 
     void updateTargetNetwork() {
-        cudaMemcpy(d_targetQ, d_onlineQ, numStates * numActions * sizeof(float), cudaMemcpyDeviceToDevice);
+        CUDA_CHECK(cudaMemcpy(d_targetQ, d_onlineQ, numStates * numActions * sizeof(float), cudaMemcpyDeviceToDevice));
     }
 
     void decayEpsilon() {
@@ -259,29 +282,28 @@ int main(){
     std::ofstream logFile("training_log.csv");
     logFile << "Episode,Steps,TotalReward,FinalState,Epsilon\n";
 
-    for(int episode = 0; episode < numEpisodes; episode++){
+    for (int episode = 0; episode < numEpisodes; episode++){
         int currentState = gridWorld.startState;
         float totalReward = 0.0f;
-        int steps = 0;
         bool done = false;
-        for(steps = 0; steps < maxStepsPerEpisode; steps++){
+        int stepsTaken = 0;
+        for (; stepsTaken < maxStepsPerEpisode && !done; stepsTaken++){
             int action = agent.chooseAction(currentState);
             int nextState = gridWorld.step(currentState, action);
-            float reward = gridWorld.getReward(currentState, nextState);
-            if(nextState == gridWorld.goalState) done = true;
+            float reward = gridWorld.getReward(currentState, action, nextState);
+            if (nextState == gridWorld.goalState) done = true;
             Transition trans { currentState, action, reward, nextState, done };
             agent.storeTransition(trans);
             totalReward += reward;
             currentState = nextState;
-            if(done) { steps++; break; }
         }
         agent.trainOnBatch();
-        if(episode % agent.updateTargetEvery == 0) {
+        if (episode % agent.updateTargetEvery == 0) {
             agent.updateTargetNetwork();
         }
         agent.decayEpsilon();
-        logFile << episode << "," << steps << "," << totalReward << "," << currentState << "," << agent.epsilon << "\n";
-        std::cout << "Episode " << episode << ": Steps = " << steps << ", Total Reward = " << totalReward
+        logFile << episode << "," << (stepsTaken) << "," << totalReward << "," << currentState << "," << agent.epsilon << "\n";
+        std::cout << "Episode " << episode << ": Steps = " << stepsTaken << ", Total Reward = " << totalReward
                   << ", Final State = " << currentState << ", Epsilon = " << agent.epsilon << "\n";
     }
     logFile.close();
@@ -294,7 +316,7 @@ int main(){
     plotScript << "plt.figure(); plt.plot(data['Episode'], data['Steps']); plt.xlabel('Episode'); plt.ylabel('Steps'); plt.title('Steps per Episode'); plt.savefig('steps_per_episode.png')\n";
     plotScript << "plt.figure(); plt.plot(data['Episode'], data['Epsilon']); plt.xlabel('Episode'); plt.ylabel('Epsilon'); plt.title('Epsilon Decay Curve'); plt.savefig('epsilon_decay.png')\n";
     plotScript.close();
-    
+
     system("python plot_results.py");
     return 0;
 }
